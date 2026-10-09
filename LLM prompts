@@ -1,0 +1,1308 @@
+ChatGPT
+You said:
+I'm currently coding a Unix-ish Shell program in java. For my shell class, my buildForkedShell method isn't working as it should. Here is the code I’m currently working with: <REDACTED>
+ChatGPT said:
+Yes — the main problem is that buildForkedShell() is currently building a process that tries to execute the command class name directly, rather than starting a new JVM running Shell.
+Your Javadoc says it should build something like:
+java -classpath <Shell's classes> Shell "<command>"
+
+
+but your implementation currently does:
+String c = findCommandClass(command);
+ProcessBuilder p = new ProcessBuilder(c);
+
+
+So for ls, you're effectively asking the OS to execute a program named Ls, which isn't what you want.
+A correct implementation should:
+Detect and remove > filename redirection.
+Reject a redirect target that is a directory.
+Start the Java executable.
+Give it the current shell classpath.
+Run Shell as the main class.
+Pass the actual command (ls, cat file, etc.) as an argument.
+Set the child's working directory to cwd.
+Redirect output when > is present.
+For example:
+ProcessBuilder buildForkedShell(String command) throws IllegalArgumentException {
+    String actualCommand = command.trim();
+    File outputFile = null;
+
+    // Handle output redirection: command > file
+    int redirectIndex = actualCommand.indexOf(">");
+    if (redirectIndex != -1) {
+        String redirectTarget = actualCommand.substring(redirectIndex + 1).trim();
+        actualCommand = actualCommand.substring(0, redirectIndex).trim();
+
+        outputFile = new File(redirectTarget);
+
+        if (outputFile.isDirectory()) {
+            throw new IllegalArgumentException(
+                    redirectTarget + ": is a directory"
+            );
+        }
+    }
+
+    String java = System.getProperty("java.home")
+            + File.separator + "bin"
+            + File.separator + "java";
+
+    ProcessBuilder pb = new ProcessBuilder(
+            java,
+            "-classpath",
+            getCurrentClassPath().toString(),
+            "Shell",
+            actualCommand
+    );
+
+    pb.directory(cwd.toFile());
+
+    if (outputFile != null) {
+        pb.redirectOutput(outputFile);
+    } else {
+        pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+    }
+
+    pb.redirectError(ProcessBuilder.Redirect.INHERIT);
+
+    return pb;
+}
+
+
+Why this works
+Suppose the user enters:
+ls
+
+
+Your ProcessBuilder becomes conceptually:
+java -classpath /.../shell/target/classes Shell "ls"
+
+
+The new JVM starts Shell.main():
+public static void main(String[] args) {
+    Shell shell = new Shell();
+    if (args.length > 0) {
+        shell.executeCommand(args[0]);
+    } else {
+        shell.runRepl();
+    }
+}
+
+
+So args[0] is "ls", and then executeCommand() does the part you already wrote correctly:
+String commandClass = findCommandClass(command);
+
+
+which gives:
+Ls
+
+
+Then it loads Ls from commandBin using your URLClassLoader.
+So the overall chain is:
+Shell
+  |
+  | ProcessBuilder
+  v
+new Java process
+  |
+  v
+Shell.main("ls")
+  |
+  v
+executeCommand("ls")
+  |
+  v
+findCommandClass("ls")
+  |
+  v
+Ls.class
+
+
+One other important issue
+Your Pipeline constructor has a separate bug that will become apparent once buildForkedShell() is fixed.
+You currently have:
+while(end < pipelineCommand.length())
+{
+    end = input.indexOf(" | ");
+
+
+After you modify input, you're mixing start, end, and the changing input string. More importantly, processInput() only creates a Pipeline but never actually executes it:
+return new Pipeline(input);
+
+
+So something like:
+ls | grep foo
+
+
+constructs the pipeline but doesn't run it.
+You probably want:
+Pipeline pipeline = new Pipeline(input);
+try {
+    pipeline.executePipeline();
+} catch (Exception e) {
+    System.err.println(e.getMessage());
+}
+return pipeline;
+
+
+There are also issues with processInput() recursively calling runRepl():
+if(!input.contains(" | "))
+{
+    executeCommand(input);
+    runRepl();
+    return null;
+}
+
+
+That will create a new REPL recursively every time a non-pipeline command executes. Eventually you'll get stack problems. processInput() should execute the command and return; the existing runRepl() loop should remain in control.
+So I'd change that section to something along these lines:
+Pipeline processInput(String input) {
+    if (input.isBlank()) {
+        return null;
+    }
+
+    if (!input.contains(" | ")) {
+        executeCommand(input);
+        return null;
+    }
+
+    Pipeline pipeline = new Pipeline(input);
+
+    try {
+        pipeline.executePipeline();
+    } catch (Exception e) {
+        System.err.println(e.getMessage());
+    }
+
+    return pipeline;
+}
+
+
+However, because your assignment appears to have specific expected behavior for builtins, background jobs, redirection, and pipelines, I'd be careful about changing more than necessary. The immediate buildForkedShell() bug is the ProcessBuilder construction: it needs to launch java Shell, not findCommandClass(command).
+You said:
+I made the fixes you suggested. My test cases are giving me the error java.lang.IllegalArgumentException: builder redirectOutput() must be PIPE except for the last builder: INHERIT. What does that mean?
+ChatGPT said:
+That error is coming from ProcessBuilder.startPipeline(pbs), and it means one of your ProcessBuilders has its output configured incorrectly for a pipeline.
+For a pipeline like:
+ls | grep foo
+
+
+Java's ProcessBuilder.startPipeline() automatically connects:
+ls stdout → grep stdin
+
+
+Therefore, every process except the last one must have its stdout set to PIPE.
+What's probably happening
+In the version I suggested, I had:
+if (outputFile != null) {
+    pb.redirectOutput(outputFile);
+} else {
+    pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+}
+
+
+That works for a single command, but it does not work for a pipeline.
+For example, your pipeline might effectively contain:
+ProcessBuilder ls = buildForkedShell("ls");
+ProcessBuilder grep = buildForkedShell("grep foo");
+
+ProcessBuilder.startPipeline(List.of(ls, grep));
+
+
+But both builders have:
+redirectOutput(INHERIT)
+
+
+Java says:
+"I need to connect ls's output to grep's input, but you've told me to send ls's output directly to the shell instead."
+Hence:
+builder redirectOutput() must be PIPE except for the last builder: INHERIT
+
+
+The fix
+You should not configure the output redirection inside buildForkedShell() for every process.
+Instead, configure the pipeline after you've constructed all the ProcessBuilders.
+Your buildForkedShell() should essentially build the process and set its working directory, but leave stdout as the default PIPE:
+ProcessBuilder buildForkedShell(String command) throws IllegalArgumentException {
+    String actualCommand = command.trim();
+
+    String java = System.getProperty("java.home")
+            + File.separator + "bin"
+            + File.separator + "java";
+
+    ProcessBuilder pb = new ProcessBuilder(
+            java,
+            "-classpath",
+            getCurrentClassPath().toString(),
+            "Shell",
+            actualCommand
+    );
+
+    pb.directory(cwd.toFile());
+
+    return pb;
+}
+
+
+Then, in Pipeline.executePipeline(), configure the last process's output.
+For example:
+public List<Process> executePipeline() throws Exception {
+    // The last process sends output to this shell's stdout.
+    pbs.get(pbs.size() - 1)
+            .redirectOutput(ProcessBuilder.Redirect.INHERIT);
+
+    // The first process gets input from this shell's stdin.
+    pbs.get(0)
+            .redirectInput(ProcessBuilder.Redirect.INHERIT);
+
+    processes = ProcessBuilder.startPipeline(pbs);
+
+    if (!isBackground) {
+        waitFor();
+    }
+
+    return processes;
+}
+
+
+Now Java can automatically connect the middle of the pipeline.
+For:
+ls | grep foo | wc
+
+
+the configuration becomes:
+stdin
+  ↓
+ls
+  ↓ PIPE
+grep foo
+  ↓ PIPE
+wc
+  ↓
+terminal
+
+
+That's exactly what startPipeline() expects.
+What about > output.txt?
+That's slightly different.
+If the user runs:
+ls | grep foo > output.txt
+
+
+then the last process should have:
+.redirectOutput(outputFile)
+
+
+instead of:
+.redirectOutput(ProcessBuilder.Redirect.INHERIT)
+
+
+So the important rule is:
+Process
+stdout
+First process in pipeline
+PIPE
+Middle processes
+PIPE
+Last process, normal
+INHERIT
+Last process, > file
+file
+
+
+Only the last process is allowed to have its stdout redirected away from PIPE.
+One other thing: if you paste your updated buildForkedShell(), Pipeline constructor, and executePipeline(), I can point out exactly where the conflicting redirectOutput() is occurring in your version.
+
+
+You said:
+my Pipeline isn't outputting anything right now. How can I fix that?
+ChatGPT said:
+Yes. The most likely issue is that your pipeline processes are running, but the last process's stdout isn't connected to your shell's stdout.
+For a normal pipeline like:
+ls | grep foo
+
+
+you want:
+ls stdout ──PIPE──> grep stdin
+                         |
+                         └── stdout ──> terminal
+
+
+Fix executePipeline()
+I'd make it:
+public List<Process> executePipeline() throws Exception {
+    // The first process receives input from this shell.
+    pbs.get(0).redirectInput(ProcessBuilder.Redirect.INHERIT);
+
+    // Every process except the last one must leave stdout as PIPE.
+    // The last process sends its output to this shell's terminal.
+    pbs.get(pbs.size() - 1)
+            .redirectOutput(ProcessBuilder.Redirect.INHERIT);
+
+    processes = ProcessBuilder.startPipeline(pbs);
+
+    if (!isBackground) {
+        waitFor();
+    }
+
+    return processes;
+}
+
+
+The important part is:
+pbs.get(pbs.size() - 1)
+    .redirectOutput(ProcessBuilder.Redirect.INHERIT);
+
+
+startPipeline() automatically handles the connections between the processes.
+But there's another likely problem in your code
+Your buildForkedShell() should not have:
+pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+
+
+Remove that entirely.
+It should look roughly like:
+ProcessBuilder buildForkedShell(String command) {
+    String java = System.getProperty("java.home")
+            + File.separator + "bin"
+            + File.separator + "java";
+
+    ProcessBuilder pb = new ProcessBuilder(
+            java,
+            "-classpath",
+            getCurrentClassPath().toString(),
+            "Shell",
+            command.trim()
+    );
+
+    pb.directory(cwd.toFile());
+
+    return pb;
+}
+
+
+Notice that there is no redirectOutput() here.
+That's intentional. The default output for a ProcessBuilder is PIPE, which is exactly what startPipeline() needs for every process except the last.
+One more thing: your child Shell may be swallowing output
+Your forked process runs:
+Shell.main("ls")
+
+
+which calls:
+executeCommand("ls")
+
+
+and then loads Ls reflectively.
+That's fine as long as Ls.main() writes to System.out normally.
+Because the child JVM's stdout is the ProcessBuilder pipe, anything that Ls prints with:
+System.out.println(...)
+
+
+will flow through the pipeline.
+So:
+Shell
+  ↓
+ProcessBuilder
+  ↓
+java Shell "ls"
+  ↓
+Ls.main()
+  ↓
+System.out
+  ↓
+PIPE
+  ↓
+java Shell "grep foo"
+  ↓
+Grep.main()
+  ↓
+System.out
+  ↓
+terminal
+
+
+Also check your Pipeline constructor
+If you're still using the constructor from your original code, I would strongly recommend replacing the parsing logic. Your current loop modifies input while also using start and end, which can cause commands to be constructed incorrectly.
+A much simpler version is:
+public Pipeline(String input) {
+    pipelineCommand = input;
+
+    String pipeline = input.trim();
+
+    if (pipeline.endsWith("&")) {
+        isBackground = true;
+        pipeline = pipeline.substring(0, pipeline.length() - 1).trim();
+    } else {
+        isBackground = false;
+    }
+
+    pbs = new ArrayList<>();
+
+    String[] commands = pipeline.split("\\s*\\|\\s*");
+
+    for (String command : commands) {
+        pbs.add(buildForkedShell(command));
+    }
+}
+
+
+Then:
+ls | grep foo
+
+
+produces:
+pbs[0] = ProcessBuilder(... "Shell" "ls")
+pbs[1] = ProcessBuilder(... "Shell" "grep foo")
+
+
+and:
+ProcessBuilder.startPipeline(pbs);
+
+
+connects them automatically.
+The key rule: don't set redirectOutput() in buildForkedShell(). Let startPipeline() use PIPE between processes, and set INHERIT only on the final process.
+You said:
+Here's my code after I made changes. <REDACTED>
+I still have the same issue where sometimes a pipeline command does not output anything
+ChatGPT said:
+I can see a few concrete problems now. The biggest one is that your pipeline setup is overwriting redirection settings, and your background-pipeline parsing is also incorrect. There are also two job-control bugs that can make things appear to hang or behave inconsistently.
+1. Your executePipeline() is overriding > file
+You currently do:
+pbs.get(pbs.size() - 1)
+    .redirectOutput(ProcessBuilder.Redirect.INHERIT);
+
+
+every time, even when buildForkedShell() already detected:
+ls > output.txt
+
+
+and did:
+pb.redirectOutput(outputFile);
+
+
+So you've essentially told the last process:
+"Send your output to this file."
+and then immediately:
+"Actually, send it to the terminal."
+You should only use INHERIT if the last process's output is still PIPE.
+Change executePipeline() to:
+public List<Process> executePipeline() throws Exception {
+    pbs.get(0).redirectInput(ProcessBuilder.Redirect.INHERIT);
+
+    ProcessBuilder last = pbs.get(pbs.size() - 1);
+
+    if (last.redirectOutput().equals(ProcessBuilder.Redirect.PIPE)) {
+        last.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+    }
+
+    processes = ProcessBuilder.startPipeline(pbs);
+
+    if (!isBackground) {
+        waitFor();
+    }
+
+    return processes;
+}
+
+
+This preserves:
+ls > output.txt
+
+
+while still making:
+ls | grep foo
+
+
+print to the terminal.
+
+2. Your background pipeline parser is definitely broken
+This is probably one of the reasons you're seeing "sometimes" no output.
+You currently do:
+if(input.contains("&"))
+{
+    isBackground = true;
+    search = " &";
+}
+else
+    search = " | ";
+
+
+That means if you enter:
+ls | grep foo &
+
+
+you're no longer looking for " | ".
+You're looking for:
+" &"
+
+
+So the entire:
+ls | grep foo
+
+
+gets passed as one command to buildForkedShell().
+Then the child shell receives:
+ls | grep foo
+
+
+but executeCommand() doesn't understand pipelines. It only executes the first command:
+String[] commandArgs = command.split("\\s+");
+String commandName = commandArgs[0];
+
+
+So it effectively runs ls and ignores the pipeline semantics.
+Fix your constructor
+First remove the & from the end, then split the remaining command on pipes:
+public Pipeline(String input) {
+    pipelineCommand = input.trim();
+
+    String command = input.trim();
+
+    if (command.endsWith("&")) {
+        isBackground = true;
+        command = command.substring(0, command.length() - 1).trim();
+    } else {
+        isBackground = false;
+    }
+
+    pbs = new ArrayList<>();
+
+    String[] commands = command.split("\\s*\\|\\s*");
+
+    for (String subcommand : commands) {
+        pbs.add(buildForkedShell(subcommand));
+    }
+}
+
+
+This is much safer than your current while loop.
+Now:
+ls | grep foo
+
+
+produces two processes:
+Shell "ls"
+Shell "grep foo"
+
+
+And:
+ls | grep foo &
+
+
+also produces two processes, but marks the pipeline as background.
+
+3. There's a serious problem with killPipeline()
+You currently have:
+public void killPipeline() {
+    if(processes == null)
+        return;
+    waitFor();
+    for(Process process : processes)
+        process.destroy();
+    terminated = true;
+}
+
+
+This is backwards.
+You're saying:
+wait for process to finish
+THEN
+kill it
+
+
+If the process is:
+sleep 1000 &
+
+
+waitFor() waits for sleep to finish.
+Then, 1000 seconds later, you try to kill it.
+Instead:
+public void killPipeline() {
+    if (processes == null)
+        return;
+
+    for (Process process : processes) {
+        process.destroy();
+    }
+
+    terminated = true;
+}
+
+
+If your assignment specifically requires waiting for termination, you can do:
+public void killPipeline() {
+    if (processes == null)
+        return;
+
+    for (Process process : processes) {
+        process.destroy();
+    }
+
+    for (Process process : processes) {
+        try {
+            process.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    terminated = true;
+    isDone = true;
+}
+
+
+That's the correct order:
+destroy()
+   ↓
+waitFor()
+
+
+not:
+waitFor()
+   ↓
+destroy()
+
+
+
+4. Your getProcesses() is also doing something strange
+You currently have:
+public List<Process> getProcesses() throws Exception{
+    if(processes == null)
+    {
+        executePipeline();
+        killPipeline();
+        return processes;
+    }
+    return processes;
+}
+
+
+That means simply asking:
+pipeline.getProcesses()
+
+
+can cause the pipeline to be:
+started
+waited for
+killed
+That's very surprising behavior.
+I'd change it to:
+public List<Process> getProcesses() {
+    return processes;
+}
+
+
+If the tests expect getProcesses() to return null before execution, that's exactly what this will do.
+
+5. Your runRepl() has another important problem
+You currently have:
+Pipeline p = processInput(command);
+p.executePipeline();
+
+
+But processInput() returns null for a normal command:
+if(!input.contains(" | ") && !input.contains("&"))
+{
+    if(tryExecuteBuiltin(input) == false)
+        executeCommand(input);
+    return null;
+}
+
+
+So for:
+ls
+
+
+you get:
+p = null
+p.executePipeline();
+
+
+That's a NullPointerException.
+More importantly, executeCommand() calls:
+System.exit(0);
+
+
+So you're mixing two different execution architectures.
+Your REPL should probably be structured like:
+public void runRepl() {
+    Scanner scan = new Scanner(System.in);
+
+    while (true) {
+        System.out.print(COMMAND_PROMPT);
+
+        String command = scan.nextLine();
+
+        if (command.equals("exit")) {
+            break;
+        }
+
+        try {
+            Pipeline p = processInput(command);
+
+            if (p != null) {
+                p.executePipeline();
+            }
+        } catch (Exception e) {
+            System.err.println(e.getMessage());
+        }
+    }
+
+    scan.close();
+}
+
+
+However, don't blindly use that exact version yet, because your assignment's expected behavior may require builtins and foreground commands to be handled differently.
+
+The most important change for your current output problem
+I'd make these three changes first.
+Pipeline constructor
+public Pipeline(String input) {
+    pipelineCommand = input.trim();
+
+    String command = input.trim();
+
+    if (command.endsWith("&")) {
+        isBackground = true;
+        command = command.substring(0, command.length() - 1).trim();
+    } else {
+        isBackground = false;
+    }
+
+    pbs = new ArrayList<>();
+
+    String[] commands = command.split("\\s*\\|\\s*");
+
+    for (String subcommand : commands) {
+        pbs.add(buildForkedShell(subcommand));
+    }
+}
+
+
+executePipeline()
+public List<Process> executePipeline() throws Exception {
+    pbs.get(0).redirectInput(ProcessBuilder.Redirect.INHERIT);
+
+    ProcessBuilder last = pbs.get(pbs.size() - 1);
+
+    if (last.redirectOutput().equals(ProcessBuilder.Redirect.PIPE)) {
+        last.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+    }
+
+    processes = ProcessBuilder.startPipeline(pbs);
+
+    if (!isBackground) {
+        waitFor();
+    }
+
+    return processes;
+}
+
+
+killPipeline()
+public void killPipeline() {
+    if (processes == null)
+        return;
+
+    for (Process process : processes) {
+        process.destroy();
+    }
+
+    for (Process process : processes) {
+        try {
+            process.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    terminated = true;
+    isDone = true;
+}
+
+
+Then test these independently:
+ls
+
+
+ls | grep foo
+
+
+ls > output.txt
+
+
+ls | grep foo > output.txt
+
+
+sleep 5 &
+
+
+The first thing I'd test is ls | grep foo. If that still produces no output after these changes, the next thing I'd inspect is the actual Ls/Grep command implementations, because at that point the pipeline wiring itself is mostly correct.
+Your Pipeline structure is close, but there are several interacting bugs. I would fix the shell around the assignment's intended design rather than trying to patch each symptom individually.
+The most important problems are:
+processInput() calls executeCommand() for a normal command. That method calls System.exit(), so the shell itself exits after one command.
+findCommandClass() is missing uniq.
+isPipeline is a global state flag that should not be there. After one pipeline, it can change how later commands behave.
+tryExecuteBuiltin() uses contains(), so something like mycd could be interpreted as cd.
+kill parses IDs one character at a time, so kill 12 becomes jobs 1 and 2.
+killJobs() assumes the job ID is the same as the list index. That stops being true once completed jobs are removed.
+listJobs() determines status by searching toString() rather than using the actual status API.
+killPipeline() doesn't wait for processes to actually terminate, despite the assignment explicitly requiring that.
+isDone is set manually rather than reflecting whether the processes have actually finished.
+Your cd .. implementation is unnecessarily complicated and incorrect for several paths.
+The REPL calls findCommandClass(command) on the entire input line, which breaks pipelines and commands with arguments.
+runRepl() catches everything as "command not found", including errors that aren't command lookup failures.
+ProcessBuilder.startPipeline() is exactly the right API here: Java connects the stdout of each process to the stdin of the next, while the first process's stdin and last process's stdout can be configured separately. OOracle Docs
+What I'd change
+You don't need to rewrite the whole class. Keep your existing executeCommand() because the assignment's child JVM mechanism relies on it. Instead, replace the shell-dispatch and job-management pieces.
+1. Fix findCommandClass
+Add uniq:
+private static String findCommandClass(String command) throws Exception {
+    if (command.equals("cat"))
+        return "Cat";
+    if (command.equals("ls"))
+        return "Ls";
+    if (command.equals("pwd"))
+        return "Pwd";
+    if (command.equals("wc"))
+        return "Wc";
+    if (command.equals("grep"))
+        return "Grep";
+    if (command.equals("head"))
+        return "Head";
+    if (command.equals("tail"))
+        return "Tail";
+    if (command.equals("sort"))
+        return "Sort";
+    if (command.equals("uniq"))
+        return "Uniq";
+    if (command.equals("sleep"))
+        return "Sleep";
+
+    throw new Exception(command + ": command not found");
+}
+
+Notice that I changed your contains() checks to equals(). That's important.
+
+2. Replace processInput()
+This is probably the single most important fix.
+Pipeline processInput(String input) throws Exception {
+    input = input.trim();
+
+    if (input.isBlank()) {
+        return null;
+    }
+
+    if (tryExecuteBuiltin(input)) {
+        return null;
+    }
+
+    Pipeline pipeline = new Pipeline(input);
+
+    if (pipeline.isBackground()) {
+        jobs.add(pipeline);
+        jobIds.add(count);
+        count++;
+    }
+
+    pipeline.executePipeline();
+
+    return pipeline;
+}
+
+The key difference is that every non-builtin command becomes a Pipeline, even something as simple as:
+ls
+
+or:
+head file.txt
+
+You should not call executeCommand() directly from the parent shell.
+The child Shell process eventually calls executeCommand(), and that child can safely call System.exit(). The parent shell remains alive.
+You can also delete:
+private boolean isPipeline = false;
+
+because you don't need it anymore.
+
+3. Simplify tryExecuteBuiltin()
+Your current version:
+if(input.contains("cd"))
+
+is dangerous.
+Instead:
+private boolean tryExecuteBuiltin(String input) {
+    String[] args = input.trim().split("\\s+");
+
+    if (args.length == 0) {
+        return false;
+    }
+
+    switch (args[0]) {
+        case "cd":
+            if (args.length != 2) {
+                System.err.println("cd: expected one argument");
+            } else {
+                changeDirectory(args[1]);
+            }
+            return true;
+
+        case "jobs":
+            if (args.length != 1) {
+                System.err.println("jobs: too many arguments");
+            } else {
+                listJobs();
+            }
+            return true;
+
+        case "kill":
+            if (args.length < 2) {
+                System.err.println("kill: arguments must be job IDs");
+                return true;
+            }
+
+            List<Integer> ids = new ArrayList<>();
+
+            for (int i = 1; i < args.length; i++) {
+                try {
+                    ids.add(Integer.parseInt(args[i]));
+                } catch (NumberFormatException e) {
+                    System.err.println("kill: arguments must be job IDs");
+                }
+            }
+
+            killJobs(ids);
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+Now:
+kill 12 13
+
+correctly produces:
+[12, 13]
+
+instead of:
+[1, 2, 1, 3]
+
+
+4. Fix changeDirectory()
+Your special handling for .. should be removed.
+void changeDirectory(String pathString) {
+    Path newPath = cwd.resolve(pathString).normalize();
+
+    if (!Files.exists(newPath) || !Files.isDirectory(newPath)) {
+        System.err.println("cd: " + pathString + ": No such file or directory");
+        return;
+    }
+
+    cwd = newPath.toAbsolutePath();
+}
+
+This has an important advantage: cd is relative to the shell's tracked working directory, which is exactly what your assignment describes.
+For example:
+cd foo
+cd ..
+
+works relative to the shell's cwd, rather than relative to whatever directory the JVM itself happens to have.
+
+5. Fix listJobs()
+The job ID should not be treated as a list index.
+For example, suppose:
+[1] Done
+[2] Running
+[3] Running
+
+Job 1 gets removed after jobs.
+Now job 2 is still job 2. It does not become job 1.
+Use:
+void listJobs() {
+    for (int i = 0; i < jobs.size(); i++) {
+        Pipeline job = jobs.get(i);
+
+        System.out.println(
+            "[" + jobIds.get(i) + "]       " + job
+        );
+
+        if (job.isDone()) {
+            jobs.remove(i);
+            jobIds.remove(i);
+            i--;
+        }
+    }
+
+    if (jobs.isEmpty()) {
+        count = 1;
+    }
+}
+
+However, this depends on isDone() correctly detecting naturally completed background processes, which leads to the next fix.
+
+6. Fix Pipeline.isDone()
+Right now:
+public boolean isDone() {
+    return isDone;
+}
+
+is unreliable for background processes.
+A background pipeline does not call waitFor(), so isDone can remain false even after the processes have naturally exited.
+Use:
+public boolean isDone() {
+    if (processes == null) {
+        return false;
+    }
+
+    for (Process process : processes) {
+        if (process.isAlive()) {
+            return false;
+        }
+    }
+
+    isDone = true;
+    return true;
+}
+
+This uses the actual process state.
+
+7. Fix waitFor()
+Your current method is mostly okay, but it should handle interruption properly:
+void waitFor() {
+    if (processes == null) {
+        return;
+    }
+
+    try {
+        for (Process process : processes) {
+            process.waitFor();
+        }
+
+        isDone = true;
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+
+8. Fix killPipeline()
+The assignment explicitly says that destroy() is asynchronous and that killPipeline() must wait until the processes actually exit.
+So this:
+for(Process process : processes)
+    process.destroy();
+
+isDone = true;
+terminated = true;
+
+is not sufficient.
+Use:
+public void killPipeline() {
+    if (processes == null) {
+        return;
+    }
+
+    for (Process process : processes) {
+        if (process.isAlive()) {
+            process.destroy();
+        }
+    }
+
+    try {
+        for (Process process : processes) {
+            process.waitFor();
+        }
+
+        isDone = true;
+        terminated = true;
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+}
+
+
+9. Fix killJobs()
+This is another significant bug.
+You currently have:
+jobs.get(id - 1)
+
+That only works if job IDs exactly equal list positions.
+Instead:
+void killJobs(List<Integer> ids) {
+    for (int id : ids) {
+        int index = jobIds.indexOf(id);
+
+        if (index == -1) {
+            System.err.println("kill: " + id + ": no such job");
+            continue;
+        }
+
+        jobs.get(index).killPipeline();
+    }
+}
+
+Now if your jobs are:
+jobIds = [2, 5, 7]
+
+then:
+kill 7
+
+correctly finds index 2.
+
+10. Your Pipeline constructor is mostly good
+I'd make it slightly cleaner:
+public Pipeline(String input) {
+    pipelineCommand = input.trim();
+
+    String command = pipelineCommand;
+
+    if (command.endsWith("&")) {
+        isBackground = true;
+        command = command.substring(0, command.length() - 1).trim();
+    } else {
+        isBackground = false;
+    }
+
+    pbs = new ArrayList<>();
+
+    String[] commands = command.split("\\s*\\|\\s*");
+
+    for (String subcommand : commands) {
+        pbs.add(buildForkedShell(subcommand));
+    }
+}
+
+This correctly handles:
+ls | grep txt
+
+and:
+ls | grep txt &
+
+
+11. Fix executePipeline()
+Your approach here is basically the right one.
+I'd write:
+public List<Process> executePipeline() throws Exception {
+    pbs.get(0).redirectInput(ProcessBuilder.Redirect.INHERIT);
+
+    ProcessBuilder last = pbs.get(pbs.size() - 1);
+
+    if (last.redirectOutput().equals(ProcessBuilder.Redirect.PIPE)) {
+        last.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+    }
+
+    processes = ProcessBuilder.startPipeline(pbs);
+
+    if (!isBackground) {
+        waitFor();
+    }
+
+    return processes;
+}
+
+This is consistent with the Java API: startPipeline() connects intermediate processes automatically, while the first input and final output are controlled by the first and last ProcessBuilder. OOracle Docs
+Your buildForkedShell() already sets ordinary output to PIPE, which lets the final pipeline stage later be changed to INHERIT; if the final command has > file, its file redirect is preserved. Java's Redirect.PIPE is the default stream-based behavior, while INHERIT connects the subprocess to the shell's corresponding stream. OOracle Docs
+
+12. Fix runRepl()
+This part is currently problematic:
+findCommandClass(command);
+Pipeline p = processInput(command);
+
+You shouldn't call findCommandClass() on the entire command line.
+For example:
+sort -r file.txt
+
+is not a class named "Sort -r file.txt".
+Your REPL should simply dispatch the line:
+public void runRepl() {
+    Scanner scan = new Scanner(System.in);
+
+    while (true) {
+        System.out.print(COMMAND_PROMPT);
+
+        if (!scan.hasNextLine()) {
+            break;
+        }
+
+        String command = scan.nextLine().trim();
+
+        if (command.equals("exit")) {
+            break;
+        }
+
+        try {
+            processInput(command);
+        } catch (Exception e) {
+            System.err.println(e.getMessage());
+        }
+    }
+
+    scan.close();
+}
+
+This also avoids throwing an exception when stdin reaches EOF.
+
+One important issue with buildForkedShell()
+Your implementation is close, but there's a subtle parsing issue.
+Currently:
+int redirectIndex = actualCommand.indexOf(">");
+
+will accept something like:
+ls > output.txt
+
+which is good, but it will also accept malformed cases such as:
+ls > output.txt something
+
+The assignment tests may expect a particular error behavior here.
+I'd first leave your redirection parser alone unless your tests are failing specifically around malformed redirects.
+The important thing is that the final pipeline stage must retain the file redirect. startPipeline() explicitly expects the intermediate builders to use PIPE, while the first/last builders determine the external input/output behavior. OOracle Docs
+
+The resulting control flow
+After these changes, the architecture should look like this:
+REPL
+ │
+ │ "ls | grep txt > out.txt &"
+ ▼
+processInput()
+ │
+ ├── builtin? ── yes ──> cd/jobs/kill
+ │
+ └── no
+      │
+      ▼
+   Pipeline
+      │
+      ├── buildForkedShell("ls")
+      ├── buildForkedShell("grep txt > out.txt")
+      │
+      ▼
+   executePipeline()
+      │
+      ▼
+   ProcessBuilder.startPipeline()
+      │
+      ├── Shell child → ls
+      │        │
+      │        └──── pipe ────┐
+      │                      ▼
+      └── Shell child → grep txt
+                               │
+                               ▼
+                            out.txt
+
+For a foreground command:
+ls
+
+the parent shell waits.
+For:
+sleep 10 &
+
+the parent shell returns immediately and stores the Pipeline in jobs.
+For:
+jobs
+
+the main shell examines those stored pipelines.
+For:
+kill 1
+
+the main shell finds job ID 1, destroys its processes, and waits for them to terminate.
+That's much closer to the architecture your assignment description is asking for.
+One thing I'd check next
+There is still a potentially important issue in buildForkedShell() involving how Shell is launched and what classpath Maven gives the child JVM. If your current tests are failing with errors like Could not find or load main class Shell, command not found, or commands working individually but failing in pipelines, send me the exact failing test output. That will tell us whether the remaining problem is in Shell.java or in the Maven/module setup.
